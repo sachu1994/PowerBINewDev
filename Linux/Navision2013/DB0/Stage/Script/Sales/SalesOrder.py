@@ -1,116 +1,128 @@
-'''
-Created on 10 Nov 2016
-@author: Abhishek
-'''
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession,SQLContext
 from pyspark import SparkConf, SparkContext
-from pyspark.sql import SQLContext
-import csv, io,re,keyring,os,datetime
-from datetime import timedelta, date
-from pyspark.sql.functions import col,max as max_,concat,concat_ws,year,when,month,to_date,lit,quarter,expr,sum,last_day,datediff,length,trim
-import datetime,time,sys,calendar
 from pyspark.sql.types import *
-import re
-from builtins import str
-import pandas as pd
-import traceback
-import os,sys,subprocess
+import pyspark.sql.functions as F
+import os,sys
 from os.path import dirname, join, abspath
-from distutils.command.check import check
 import datetime as dt
-
-helpersDir = '/home/padmin/KockpitStudio'
-sys.path.insert(0, helpersDir)
-from ConfigurationFiles.AppConfig import *
-from Helpers.Constants import *
-from Helpers.udf import *
-from Helpers import udf as Kockpit
-
-def sales_SalesOrder(sqlCtx, spark):
-    st = dt.datetime.now()
-    logger = Logger()
-    Configurl = "jdbc:postgresql://192.10.15.134/Configurator_Linux"
-
+begin_time = dt.datetime.now()
+Connection =abspath(join(join(dirname(__file__), '..'),'..','..','..','DB1'))
+Stage1_Path = abspath(join(join(dirname(__file__),'..','..','..')))
+sys.path.insert(0, Connection)
+from Configuration.AppConfig import * 
+from Configuration.Constant import *
+from Configuration.udf import *
+Connection =abspath(join(join(dirname(__file__), '..'),'..','..','..','DB1','E1'))
+Abs_Path =abspath(join(join(dirname(__file__), '..'),'..','..','..')) 
+KockpitPath =abspath(join(join(dirname(__file__), '..'),'..','..','..'))
+DB0=abspath(join(join(dirname(__file__), '..'),'..','..'))
+DB0 =os.path.split(DB0)
+DB0 = DB0[1]
+owmode = 'overwrite'
+apmode = 'append'                           
+st = dt.datetime.now()
+conf = SparkConf().setMaster(SPARK_MASTER).setAppName("SalesOrder")\
+        .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")\
+        .set("spark.kryoserializer.buffer.max","512m")\
+        .set("spark.cores.max","24")\
+        .set("spark.executor.memory","8g")\
+        .set("spark.driver.memory","24g")\
+        .set("spark.driver.maxResultSize","20g")\
+        .set("spark.memory.offHeap.enabled",'true')\
+        .set("spark.memory.offHeap.size","100g")\
+        .set('spark.scheduler.mode', 'FAIR')\
+        .set("spark.sql.broadcastTimeout", "36000")\
+        .set("spark.network.timeout", 10000000)\
+        .set("spark.jars.packages", "io.delta:delta-core_2.12:0.7.0")\
+        .set("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")\
+        .set("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")\
+        .set("spark.databricks.delta.vacuum.parallelDelete.enabled",'true')\
+        .set("spark.databricks.delta.retentionDurationCheck.enabled",'false')\
+        .set('spark.hadoop.mapreduce.output.fileoutputformat.compress', 'false')\
+        .set("spark.rapids.sql.enabled", True)\
+        .set("spark.sql.legacy.parquet.int96RebaseModeInWrite", "CORRECTED")
+sc = SparkContext(conf = conf)
+sqlCtx = SQLContext(sc)
+spark = sqlCtx.sparkSession 
+fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(sc._jsc.hadoopConfiguration()) 
+i=1
+for dbe in config["DbEntities"]:
     try:
-        
-        SH_Entity = next (table for table in config["TablesToIngest"] if table["Table"] == "Sales Header")
-        SL_Entity = next (table for table in config["TablesToIngest"] if table["Table"] == "Sales Line") 
-        
-        for entityObj in config["DbEntities"]:
-            logger = Logger()
-            entityLocation = entityObj["Location"]
-            DBName = entityLocation[:3]
-            EntityName = entityLocation[-2:]
-            hdfspath = STAGE1_PATH + "/" + entityLocation
-            postgresUrl = PostgresDbInfo.url.format(entityLocation)
-            
-            SH = ToDFWitoutPrefix(sqlCtx, hdfspath, SH_Entity,True)
-            SL = ToDFWitoutPrefix(sqlCtx, hdfspath, SL_Entity,True)
-            SL = SL.withColumnRenamed('No_','ItemNo_')
-            
-            SO = SL.join(SH, SL['DocumentNo_']==SH['No_'], 'left')
-            SO = SO.filter(SO['DocumentType']==1).filter(year(SO['PostingDate'])!=1753)
-            SO = SO.withColumn("NOD",datediff(SO['PromisedDeliveryDate'],lit(datetime.datetime.today())))
-            
-            SO =  SO.withColumn("LineAmount",when((SO.LineAmount/SO.CurrencyFactor).isNull(),SO.LineAmount).otherwise(SO.LineAmount/SO.CurrencyFactor))\
-                    .withColumn("Transaction_Type",lit("SalesOrder"))
-            
-            SO.cache()
-            list = SO.select("NOD").distinct().rdd.flatMap(lambda x: x).collect()
-            list = [x for x in list if x is not None]
-            
-            Query_PDDBucket="(SELECT *\
-                        FROM "+chr(34)+"tblPDDBucket"+chr(34)+") AS df"
-            PDDBucket = spark.read.format("jdbc").options(url=Configurl, dbtable=Query_PDDBucket,\
-                            user="postgres",password="admin",driver= "org.postgresql.Driver").load()
-            Bucket = RENAME(PDDBucket,{"Min Limit":"LowerLimit","Max Limit":"UpperLimit"
-                                       ,"Bucket Name":"BucketName","Bucket Sort":"BucketSort"})
-            Bucket = Bucket.drop('DBName','EntityName')
-            Bucket = Bucket.collect()
-            
-            TempBuckets = BUCKET(list,Bucket,spark)
-            TempBuckets.show()
-            
-            SO = LJOIN(SO,TempBuckets,'NOD')
-            
-            DSE = sqlCtx.read.parquet(hdfspath + "/DSE").drop("DBName","EntityName")
-            finalDF = SO.join(DSE,"DimensionSetID",'left')
-            
-            finalDF = Kockpit.RenameDuplicateColumns(finalDF)
-            
-            finalDF.cache()
-            finalDF.write.jdbc(url=postgresUrl, table="Sales.SalesOrder", mode='overwrite', properties=PostgresDbInfo.props)#PostgresDbInfo.props
-            
-            
-            logger.endExecution()
-            
+        logger =Logger()
+        count=len(config["DbEntities"])
+        if dbe['ActiveInactive']=='true' and dbe==config["DbEntities"][0]:
             try:
-                IDEorBatch = sys.argv[1]
-            except Exception as e :
-                IDEorBatch = "IDLE"
-
-            log_dict = logger.getSuccessLoggedRecord("Sales.Sales_Order", DBName, EntityName, finalDF.count(), len(finalDF.columns), IDEorBatch)
-            log_df = spark.createDataFrame(log_dict, logger.getSchema())
-            log_df.write.jdbc(url=PostgresDbInfo.logsDbUrl, table="logtable", mode='append', properties=PostgresDbInfo.props)
+                location=dbe['Location']
+                DBName=location[0:3]
+                EntityName=location[-2:]
+                CompanyName=dbe['Location']+dbe['Name']
+                CompanyName=CompanyName.replace(" ","")
+                Path = HDFS_PATH+"/"+KockpitPath+"/"+DBName+"/"+EntityName+"/Stage2/ParquetData/Sales/SalesOrder"
+                fe = fs.exists(sc._jvm.org.apache.hadoop.fs.Path(Path))
+                if(fe):
+                    finalDF=spark.read.format("delta").load(Path)
+                    finalDF.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="Sales.SalesOrder", mode=owmode, properties=PostgresDbInfo.props)
+            except Exception as ex:
+                exc_type,exc_value,exc_traceback=sys.exc_info()
+                print("Error:",ex)
+                print("type - "+str(exc_type))
+                print("File - "+exc_traceback.tb_frame.f_code.co_filename)
+                print("Error Line No. - "+str(exc_traceback.tb_lineno))
+                logger.endExecution()
+                try:
+                    IDEorBatch = sys.argv[1]
+                except Exception as e :
+                    IDEorBatch = "IDLE"
+                os.system("spark-submit "+KockpitPath+"/Email.py 1 SalesOrder "+CompanyName+" "+DB0+" "+str(exc_traceback.tb_lineno)+"")
+                log_dict = logger.getErrorLoggedRecord('Sales.SalesOrder  ', DB0, " ", str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
+                log_df = spark.createDataFrame(log_dict, logger.getSchema())
+                log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)        
+        elif dbe['ActiveInactive']=='true' and dbe==config["DbEntities"][i]:
+            try:
+                location=dbe['Location']
+                DBName=location[0:3] 
+                EntityName=location[-2:]
+                CompanyName=dbe['Location']+dbe['Name']
+                CompanyName=CompanyName.replace(" ","")
+                Path1 = HDFS_PATH+"/"+KockpitPath+"/"+DBName+"/"+EntityName+"/Stage2/ParquetData/Sales/SalesOrder"
+                fe = fs.exists(sc._jvm.org.apache.hadoop.fs.Path(Path1))
+                if(fe):
+                    finalDF=spark.read.format("delta").load(Path1)
+                    finalDF.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="Sales.SalesOrder", mode=apmode, properties=PostgresDbInfo.props)
+            except Exception as ex:
+                exc_type,exc_value,exc_traceback=sys.exc_info()
+                print("Error:",ex)
+                print("type - "+str(exc_type))
+                print("File - "+exc_traceback.tb_frame.f_code.co_filename)
+                print("Error Line No. - "+str(exc_traceback.tb_lineno))
+                logger.endExecution()
+            
+                try:
+                    IDEorBatch = sys.argv[1]
+                except Exception as e :
+                    IDEorBatch = "IDLE"
+                
+                os.system("spark-submit "+KockpitPath+"/Email.py 1 SalesOrder "+CompanyName+" "+DB0+" "+str(exc_traceback.tb_lineno)+"")
+                log_dict = logger.getErrorLoggedRecord('Sales.SalesOrder  ', DB0, " ", str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
+                log_df = spark.createDataFrame(log_dict, logger.getSchema())
+                log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)                  
+        elif dbe['ActiveInactive']=='false':
+            
+            continue               
     except Exception as ex:
-        exc_type,exc_value,exc_traceback=sys.exc_info()
-        print("Error:",ex)
-        print("type - "+str(exc_type))
-        print("File - "+exc_traceback.tb_frame.f_code.co_filename)
-        print("Error Line No. - "+str(exc_traceback.tb_lineno))
-        ex = str(ex)
-        logger.endExecution()
-
-        try:
-            IDEorBatch = sys.argv[1]
-        except Exception as e :
-            IDEorBatch = "IDLE"
-        
-        log_dict = logger.getErrorLoggedRecord('Sales.Sales_Order', DBName, EntityName, str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
-        log_df = spark.createDataFrame(log_dict, logger.getSchema())
-        log_df.write.jdbc(url=PostgresDbInfo.logsDbUrl, table="logtable", mode='append', properties=PostgresDbInfo.props)
-    print('sales_SalesOrder completed: ' + str((dt.datetime.now()-st).total_seconds()))
-    
-if __name__ == "__main__":
-    sqlCtx, spark = getSparkConfig(SPARK_MASTER, "Stage2:Sales.SalesOrder")
-    sales_SalesOrder(sqlCtx, spark)
+                exc_type,exc_value,exc_traceback=sys.exc_info()
+                print("Error:",ex)
+                print("type - "+str(exc_type))
+                print("File - "+exc_traceback.tb_frame.f_code.co_filename)
+                print("Error Line No. - "+str(exc_traceback.tb_lineno))
+                logger.endExecution()
+                try:
+                    IDEorBatch = sys.argv[1]
+                except Exception as e :
+                    IDEorBatch = "IDLE"
+                os.system("spark-submit "+KockpitPath+"/Email.py 1 SalesOrder "+CompanyName+" "+DB0+" "+str(exc_traceback.tb_lineno)+"")
+                log_dict = logger.getErrorLoggedRecord('Sales.SalesOrder  ', DB0, " ", str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
+                log_df = spark.createDataFrame(log_dict, logger.getSchema())
+                log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)
+i+=1
+print('Sales_SalesOrder DB0 completed: ' + str((dt.datetime.now()-st).total_seconds()))  
