@@ -1,136 +1,70 @@
-'''
-Created on 16 Feb 2021
-
-@author: Prashant
-'''
-from pyspark.sql import SparkSession
 from pyspark import SparkConf, SparkContext
-from pyspark.sql import SQLContext
-import csv, io,re,keyring,os,datetime
-from datetime import timedelta, date
-from pyspark.sql.functions import col,max as max_,concat,concat_ws,year,when,month,to_date,lit,quarter,expr,count,desc,round,udf,length,explode,split,regexp_replace,coalesce
-import datetime,time,sys,calendar
+from pyspark.sql import SQLContext, SparkSession
 from pyspark.sql.types import *
-import re
+import io,os,datetime
+from pyspark.sql.functions import col,concat,when,lit,udf,length,explode,split,regexp_replace,coalesce
+import datetime,time,sys
+from pyspark.sql.types import *
+from pyspark.sql.types import StringType
 from builtins import str
-import pandas as pd
-import traceback
-import os,sys,subprocess
 from os.path import dirname, join, abspath
-from distutils.command.check import check
-import datetime, time
 import datetime as dt
-from datetime import datetime
-
-helpersDir = '/home/padmin/KockpitStudio'
-sys.path.insert(0, helpersDir)
-from ConfigurationFiles.AppConfig import *
-from Helpers.Constants import *
-from Helpers.udf import *
-
-def finance_MISPNL(sqlCtx, spark):
-    st = dt.datetime.now()
-    logger = Logger()
-    Configurl = "jdbc:postgresql://192.10.15.134/Configurator_Linux"
-    Datelog = datetime.datetime.now().strftime('%Y-%m-%d')
-    start_time = datetime.datetime.now()
-    start_time_string = start_time.strftime('%H:%M:%S')
-
-    
-    try:
-        
-        Acc_Sche_Entity = next (table for table in config["TablesToIngest"] if table["Table"] == "Acc_ Schedule Line")
-        GLA_Entity = next (table for table in config["TablesToIngest"] if table["Table"] == "G_L Account")
-        
-        
-        for entityObj in config["DbEntities"]:
+st = dt.datetime.now()
+Kockpit_Path =abspath(join(join(dirname(__file__),'..','..','..','..','..')))
+DB1_path =abspath(join(join(dirname(__file__),'..','..','..','..')))
+sys.path.insert(0,'../../')
+sys.path.insert(0, DB1_path)
+from Configuration.AppConfig import * 
+from Configuration.Constant import *
+from Configuration.udf import *
+from Configuration import udf as Kockpit
+Filepath = os.path.dirname(os.path.abspath(__file__))
+FilePathSplit = Filepath.split('\\')
+DBName = FilePathSplit[-5]
+EntityName = FilePathSplit[-4]
+DBEntity = DBName+EntityName
+entityLocation = DBName+EntityName
+STAGE1_Configurator_Path=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage1/ConfiguratorData/"
+STAGE1_PATH=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage1/ParquetData"
+STAGE2_PATH=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage2/ParquetData"
+conf = SparkConf().setMaster("local[*]").setAppName("MISPNL").\
+                    set("spark.sql.shuffle.partitions",16).\
+                    set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").\
+                    set("spark.local.dir", "/tmp/spark-temp").\
+                    set("spark.driver.memory","30g").\
+                    set("spark.executor.memory","30g").\
+                    set("spark.driver.cores",'*').\
+                    set("spark.driver.maxResultSize","0").\
+                    set("spark.sql.debug.maxToStringFields", "1000").\
+                    set("spark.executor.instances", "20").\
+                    set('spark.scheduler.mode', 'FAIR').\
+                    set("spark.sql.broadcastTimeout", "36000").\
+                    set("spark.network.timeout", 10000000).\
+                    set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "LEGACY").\
+                    set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "LEGACY").\
+                    set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED").\
+                    set("spark.sql.legacy.timeParserPolicy","LEGACY").\
+                    set("spark.sql.legacy.parquet.int96RebaseModeInWrite","LEGACY").\
+                    set("spark.sql.legacy.parquet.int96RebaseModeInWrite","CORRECTED")
+sc = SparkContext(conf = conf)
+sqlCtx = SQLContext(sc)
+spark = sqlCtx.sparkSession
+fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(sc._jsc.hadoopConfiguration())
+for dbe in config["DbEntities"]:
+    if dbe['ActiveInactive']=='true' and  dbe['Location']==DBEntity:
+        CompanyName=dbe['Name']
+        CompanyName=CompanyName.replace(" ","")
+        try:
             logger = Logger()
-            entityLocation = entityObj["Location"]
-            DBName = entityLocation[:3]
-            EntityName = entityLocation[-2:]
-            hdfspath = STAGE1_PATH + "/" + entityLocation
-            postgresUrl = PostgresDbInfo.url.format(entityLocation)
-            DBurl = "jdbc:postgresql://192.10.15.134/"+entityLocation
-            ####################### DB Credentials  ###########################
-
-            Query_df="(SELECT *\
-                                FROM "+chr(34)+"tblCompanyName"+chr(34)+") AS df"
-            df = spark.read.format("jdbc").options(url=PostgresDbInfo.Configurl, dbtable=Query_df,\
-                                    user=PostgresDbInfo.props["user"],password=PostgresDbInfo.props["password"],driver= PostgresDbInfo.props["driver"]).load()
+            Acc_Sche =spark.read.format("parquet").load(STAGE1_PATH+"/Acc_ Schedule Line")
+            COA = spark.read.format("parquet").load(STAGE1_PATH+"/G_L Account")
+            df = spark.read.format("parquet").load(STAGE1_Configurator_Path+"/tblCompanyName")
             df = df.filter(col('DBName')==DBName).filter(col('NewCompanyName') == EntityName)
-
-            #..........................Starting...............................#
-            def addColumnIndex(df):
-                newSchema = StructType(df.schema.fields +[StructField("id",IntegerType(),False),])
-                #print(newSchema)
-                df_added = df.rdd.zipWithIndex().map(lambda row:row[0]+(row[1],)).toDF(newSchema)
-                return df_added
-
-            def split_dataframe(df,seperate,target_col,new_col):#seperates the elements of the target columns according to seperator
-                df = df.withColumn(new_col, split(target_col, seperate))
-                return df
-
-            def only_minus(df,seperate,target_col,new_col):
-                df_minus = split_dataframe(df, seperate, target_col, new_col)
-                flag=[]
-                for j in df_minus.select(new_col).collect():
-                    s=j.Totaling
-                    if len(s)==1:
-                        flag.append(1)
-                    else:
-                        flag.append(1)
-                        for i in range(1,len(s)):
-                            flag.append(-1)
-
-                flag_df = sqlCtx.createDataFrame(flag, IntegerType())
-                flag_df = addColumnIndex(flag_df)
-                flag_df = flag_df.withColumnRenamed('value','Neg_Flag')
-                df_minus = df_minus.withColumn(new_col, explode(df_minus.Totaling))
-                df_minus = addColumnIndex(df_minus)
-                df_minus=df_minus.join(flag_df,df_minus.id==flag_df.id)
-                df_minus = df_minus.drop('id')
-                df_minus = df_minus.sort('LineNo_')
-                return df_minus
-
-            def divide(df,seperate,target_col,new_col):
-                df_divide = split_dataframe(df, seperate, target_col, new_col)
-                divide_flag=[]
-                list_col = df_divide.select(new_col).collect()
-                for j in list_col:
-                    j = j.Totaling
-                    if len(j)==1:
-                        divide_flag.append("N")
-                    else:
-                        divide_flag.append("N")
-                        for i in range(1,len(j)):
-                            divide_flag.append("D")
-                flag_df = sqlCtx.createDataFrame(divide_flag, StringType())
-                flag_df = addColumnIndex(flag_df)
-                flag_df = flag_df.withColumnRenamed('value','Divisor_Flag')
-                df_divide = df_divide.withColumn(new_col, explode(df_divide.Totaling))
-                df_divide = addColumnIndex(df_divide)
-                df_divide = df_divide.join(flag_df,df_divide.id==flag_df.id).drop('id')
-                return df_divide
-
-            def plus(df,seperate,target_col,new_col):
-                df_plus = split_dataframe(df, seperate, target_col, new_col)
-                df_plus = df_plus.withColumn(new_col, explode(df_plus[new_col]))
-
-                return df_plus
-
-            #############################FUNCTIONS#########################################
-
-            #------------------------Data Extraction----------------------#
-            
-            Acc_Sche = ToDFWitoutPrefix(sqlCtx, hdfspath, Acc_Sche_Entity,True)
-            COA = ToDFWitoutPrefix(sqlCtx, hdfspath, GLA_Entity,True)
             COA = COA.select("No_","Name","AccountType","Income_Balance","Totaling")
+            COA=COA.filter(COA['No_']!='SERVER')
             Acc_Sche = Acc_Sche.select("ScheduleName","LineNo_","RowNo_","Description","Totaling",
                                     "TotalingType","ShowOppositeSign","RowType","AmountType")
             Acc_Sche = Acc_Sche.filter(Acc_Sche["ScheduleName"]=="P&L_NEW")
-            #----#RE Salary GL = 9999999
-            #Acc_Sche = Acc_Sche.withColumn("Description",when(condition, value))
-
             Acc_Sche = Acc_Sche.withColumn("Totaling",when(Acc_Sche["Description"]=='RE Salary', lit(9999999))\
                                         .otherwise(Acc_Sche["Totaling"]))
             Acc_Sche = Acc_Sche.withColumn("Totaling",when(Acc_Sche["Description"]=='Corporate Expenses', lit(8888888))\
@@ -146,28 +80,19 @@ def finance_MISPNL(sqlCtx, spark):
                                                                     .withColumnRenamed("test","Totaling")
             Acc_Sche = Acc_Sche.withColumn('LineType',when(length(Acc_Sche.Totaling)==0, lit('H'))\
                                                     .when(Acc_Sche.TotalingType==2, lit('F')).otherwise(lit('')))
-            #Acc_Sche = Acc_Sche.withColumn("Description",when((~(Acc_Sche["LineType"].isin(['H','F']))), concat(lit("     "),Acc_Sche["Description"]))\
-            #                               .otherwise(Acc_Sche["Description"]))
-            #Acc_Sche.sort('LineNo_').show(30,False)
-            #sys.exit()
             Acc_Sche_null=Acc_Sche.filter(Acc_Sche.Totaling=='')
             Acc_Sche_not_null=Acc_Sche.filter(Acc_Sche.Totaling!='')
             row_COA = [int(i.No_) for i in COA.select('No_').collect()]
-
             df=Acc_Sche_not_null.withColumn("Totaling", explode(split("Totaling", "[|]")))
-
-            df = divide(df, "/", "Totaling", "Totaling")  #(New Column Should be similar as target column)
+            df = Kockpit.divide(df, "/", "Totaling", "Totaling",spark) 
             df = df.sort('LineNo_')
-
-            df_minus=only_minus(df,"-","Totaling","Totaling")   #(New Column Should be similar as target column)
-            dfm_plus=plus(df_minus,"[+]","Totaling","Totaling")   #(New Column Should be similar as target column)
+            df_minus=Kockpit.only_minus(df,"-","Totaling","Totaling",spark)  
+            dfm_plus=Kockpit.plus(df_minus,"[+]","Totaling","Totaling")   
             dfm_plus=dfm_plus.withColumn('Totaling', regexp_replace('Totaling', '\\(|\\)', ''))
             dfm_plus.sort("LineNo_")
-
-            #------------Removing Brackets--------------#
             dfn_dot=dfm_plus.filter(~dfm_plus.Totaling.like("%..%"))
             df_dot = dfm_plus.filter(dfm_plus.Totaling.like("%..%"))
-            df_dot = addColumnIndex(df_dot)
+            df_dot = Kockpit.addColumnIndex(df_dot,spark)
             d = [i.Totaling for i in df_dot.select('Totaling').collect()]
             dot=[]
             for i in range(0,len(d)):
@@ -178,27 +103,20 @@ def finance_MISPNL(sqlCtx, spark):
                         l.append(i)
                 q = '|'.join(str(e) for e in l)
                 dot.append(q)
-
             kdot=sqlCtx.createDataFrame(dot,StringType())
-            kdot = addColumnIndex(kdot)
+            kdot = Kockpit.addColumnIndex(kdot,spark)
             kdot = kdot.withColumnRenamed('value','dot_splitted')
             df_dot=df_dot.join(kdot,["id"]).drop('id')
-
-            #------------Changing .. --------------#
-
             df_dot = df_dot.withColumn("Totaling", explode(split("dot_splitted","[|]")))
             df_dot=df_dot.drop("dot_splitted")
-
             df_con=dfn_dot.union(df_dot)
-
-            ##############Final Concatenated Dataframe################
             for i in range(0,10):
                 seperated=df_con.select(["RowNo_","Totaling","Neg_Flag","RowType"])
                 seperated=seperated.withColumnRenamed("Totaling","join"+str(i))\
                             .withColumnRenamed("RowNo_","join"+str(i)+"_RowNo_")\
                             .withColumnRenamed("Neg_Flag","join"+str(i)+"_Neg_Flag")\
                             .withColumnRenamed("RowType","join"+str(i)+"_RowType")
-
+        
                 con = df_con["Totaling"] == seperated["join"+str(i)+"_RowNo_"]
                 df_con = df_con.join(seperated,con,'left')
                 df_con = df_con.withColumn("join"+str(i),coalesce(df_con["join"+str(i)],df_con["Totaling"]))
@@ -215,51 +133,45 @@ def finance_MISPNL(sqlCtx, spark):
                 df_con = df_con.sort('LineNo_')
                 df_con = df_con.na.fill({"join"+str(i)+"_RowNo_":0})
                 df_con = df_con.withColumn("join"+str(i)+"_RowNo_",(df_con["join"+str(i)+"_RowNo_"]).cast('int'))
-
                 sum_of_col = sum(df_con.select("join"+str(i)+"_RowNo_").rdd.flatMap(lambda x: x).collect())
                 if sum_of_col == 0:
                     df_con = df_con.withColumnRenamed('Totaling','MISKEY')
                     break
-
-            #######Completed Account Schedule########
-
+        
             MIS = df_con.withColumn('DBName',lit(DBName))\
                         .withColumn('EntityName',lit(EntityName))
             MIS = MIS.withColumn('Link_GL_Key',concat(MIS['DBName'],lit('|'),MIS['EntityName'],lit('|'),MIS['MISKEY']))
-            MIS = CONCATENATE(MIS,Acc_Sche_null,spark)
-
+            MIS=CONCATENATE(MIS,Acc_Sche_null,spark)
             MIS.cache()
-            MIS.write.jdbc(url=postgresUrl, table="Finance.MISPNL_Customized", mode='overwrite', properties=PostgresDbInfo.props)
+            print(MIS.count())
+            MIS.coalesce(1).write.format("parquet").mode("overwrite").option("overwriteSchema", "true").save(STAGE2_PATH+"/"+"Finance/MISPNL")
             logger.endExecution()
-                
             try:
                 IDEorBatch = sys.argv[1]
             except Exception as e :
                 IDEorBatch = "IDLE"
-
+        
             log_dict = logger.getSuccessLoggedRecord("Finance.MISPNL", DBName, EntityName, MIS.count(), len(MIS.columns), IDEorBatch)
             log_df = spark.createDataFrame(log_dict, logger.getSchema())
-            log_df.write.jdbc(url=PostgresDbInfo.logsDbUrl, table="logtable", mode='append', properties=PostgresDbInfo.props)
-    except Exception as ex:
-        exc_type,exc_value,exc_traceback=sys.exc_info()
-        print("Error:",ex)
-        print("type - "+str(exc_type))
-        print("File - "+exc_traceback.tb_frame.f_code.co_filename)
-        print("Error Line No. - "+str(exc_traceback.tb_lineno))
+            log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)
+            #
+        except Exception as ex:
+            exc_type,exc_value,exc_traceback=sys.exc_info()
+            print("Error:",ex)
+            print("type - "+str(exc_type))
+            print("File - "+exc_traceback.tb_frame.f_code.co_filename)
+            print("Error Line No. - "+str(exc_traceback.tb_lineno))
+            logger.endExecution()
         
-        logger.endExecution()
+            try:
+                IDEorBatch = sys.argv[1]
+            except Exception as e :
+                IDEorBatch = "IDLE"
+            os.system("spark-submit "+Kockpit_Path+"/Email.py 1 MISPNL '"+CompanyName+"' "+DBEntity+" "+str(exc_traceback.tb_lineno)+" ")
+    
+            log_dict = logger.getErrorLoggedRecord('Finance.MISPNL', DBName, EntityName, str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
+            log_df = spark.createDataFrame(log_dict, logger.getSchema())
+            log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)
+print('finance_MISPNL completed: ' + str((dt.datetime.now()-st).total_seconds()))     
 
-        try:
-            IDEorBatch = sys.argv[1]
-        except Exception as e :
-            IDEorBatch = "IDLE"
-        
-        log_dict = logger.getErrorLoggedRecord('Finance.MISPNL', DBName, EntityName, str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
-        log_df = spark.createDataFrame(log_dict, logger.getSchema())
-        log_df.write.jdbc(url=PostgresDbInfo.logsDbUrl, table="logtable", mode='append', properties=PostgresDbInfo.props)
-    print('finance_MISPNL_Customized completed: ' + str((dt.datetime.now()-st).total_seconds()))
-    
-if __name__ == "__main__":
-    sqlCtx, spark = getSparkConfig(SPARK_MASTER, "Stage2:MISPNL_Customized")
-    finance_MISPNL(sqlCtx, spark)
-    
+

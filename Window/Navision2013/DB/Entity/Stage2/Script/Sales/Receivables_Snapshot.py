@@ -1,30 +1,41 @@
-
-from datetime import timedelta
 from pyspark import SparkConf, SparkContext
 from pyspark.sql import SparkSession,SQLContext
-from pyspark.sql.functions import when,col,to_date,year,concat,month,lit,last_day,datediff
+from pyspark.sql.functions import col,concat,year,when,month,to_date,lit,sum,last_day,datediff
 import datetime as dt 
 import os,sys,datetime
+from datetime import timedelta
 from os.path import dirname, join, abspath
 st = dt.datetime.now()
 Kockpit_Path =abspath(join(join(dirname(__file__),'..','..','..','..','..')))
-sys.path.insert(0,'../../../..')
+DB1_path =abspath(join(join(dirname(__file__),'..','..','..','..')))
+sys.path.insert(0,'../../')
+sys.path.insert(0, DB1_path)
 from Configuration.AppConfig import * 
 from Configuration.Constant import *
 from Configuration.udf import *
 from Configuration import udf as Kockpit
-
 Filepath = os.path.dirname(os.path.abspath(__file__))
 FilePathSplit = Filepath.split('\\')
 DBName = FilePathSplit[-5]
 EntityName = FilePathSplit[-4]
-Abs_Path =abspath(join(join(dirname(__file__), '..'),'..','..'))
-DBNamepath= abspath(join(join(dirname(__file__), '..'),'..','..','..'))
 DBEntity = DBName+EntityName
 
+STAGE1_Configurator_Path=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage1/ConfiguratorData/"
+STAGE1_PATH=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage1/ParquetData"
+STAGE2_PATH=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage2/ParquetData"
 conf = SparkConf().setMaster("local[*]").setAppName("Receivables_Snapshot").\
+                    set("spark.sql.shuffle.partitions",16).\
                     set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").\
                     set("spark.local.dir", "/tmp/spark-temp").\
+                    set("spark.driver.memory","30g").\
+                    set("spark.executor.memory","30g").\
+                    set("spark.driver.cores",'*').\
+                    set("spark.driver.maxResultSize","0").\
+                    set("spark.sql.debug.maxToStringFields", "1000").\
+                    set("spark.executor.instances", "20").\
+                    set('spark.scheduler.mode', 'FAIR').\
+                    set("spark.sql.broadcastTimeout", "36000").\
+                    set("spark.network.timeout", 10000000).\
                     set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "LEGACY").\
                     set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "LEGACY").\
                     set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED").\
@@ -32,26 +43,27 @@ conf = SparkConf().setMaster("local[*]").setAppName("Receivables_Snapshot").\
                     set("spark.sql.legacy.parquet.int96RebaseModeInWrite","LEGACY").\
                     set("spark.sql.legacy.parquet.int96RebaseModeInWrite","CORRECTED")
 sc = SparkContext(conf = conf)
-sqlctx = SQLContext(sc)
-spark = sqlctx.sparkSession
+sqlCtx = SQLContext(sc)
+spark = sqlCtx.sparkSession
 for dbe in config["DbEntities"]:
     if dbe['ActiveInactive']=='true' and  dbe['Location']==DBEntity:
         CompanyName=dbe['Name']
         CompanyName=CompanyName.replace(" ","")
         try:
             logger = Logger()
-            cle =spark.read.parquet("../../../Stage1/ParquetData/Cust_LedgerEntry")
-            dcle = spark.read.parquet("../../../Stage1/ParquetData/DetailedCust_Ledg_Entry")
-            sih=spark.read.parquet("../../../Stage1/ParquetData/SalesInvoiceHeader")
-            cpg =spark.read.parquet("../../../Stage1/ParquetData/CustomerPostingGroup")
-            CD= spark.read.parquet("../../../Stage1/ParquetData/CollectionDetails")
-            DSE =spark.read.parquet("../../ParquetData/Master/DSE")
-            GLRange=spark.read.parquet("../../../Stage1/ConfiguratorData/tblGLAccountMapping")
-            Company =spark.read.parquet("../../../Stage1/ConfiguratorData/tblCompanyName")
-            ARBucket =spark.read.parquet("../../../Stage1/ConfiguratorData/tblARBucket")
+            cle =spark.read.format("parquet").load(STAGE1_PATH+"/Cust_ Ledger Entry")
+            dcle = spark.read.format("parquet").load(STAGE1_PATH+"/Detailed Cust_ Ledg_ Entry")
+            sih=spark.read.format("parquet").load(STAGE1_PATH+"/Sales Invoice Header")
+            cpg =spark.read.format("parquet").load(STAGE1_PATH+"/Customer Posting Group")
+            DSE=spark.read.format("parquet").load(STAGE1_PATH+"/"+"../../"+"Stage2/ParquetData/Masters/DSE").drop("DBName","EntityName")
+            CD=spark.read.format("parquet").load(STAGE1_PATH+"/Collection Details")
+            GLRange=spark.read.format("parquet").load(STAGE1_Configurator_Path+"/tblGLAccountMapping")
+            Company =spark.read.format("parquet").load(STAGE1_Configurator_Path+"/tblCompanyName")
+            ARBucket =spark.read.format("parquet").load(STAGE1_Configurator_Path+"/tblARBucket")
+            pdm =spark.read.format("parquet").load(STAGE1_PATH+"/Payment Delay Masters")
+            doc=spark.read.format("parquet").load(STAGE1_PATH+"/Documentation")
             Datelog = datetime.datetime.now().strftime('%Y-%m-%d')
-            
-            cle = cle.select('CustomerNo_','SalespersonCode','DueDate','EntryNo_','DocumentNo_','PostingDate','CustomerPostingGroup','DimensionSetID','ExternalDocumentNo_','DocumentType','CurrencyCode','AdvanceCollection','YearMonth')
+            cle = cle.select('CustomerNo_','SalespersonCode','DueDate','EntryNo_','DocumentNo_','PostingDate','CustomerPostingGroup','DimensionSetID','ExternalDocumentNo_','DocumentType','CurrencyCode','AdvanceCollection')
             dcle = dcle.select('AmountLCY','Amount','PostingDate','EntryType','Cust_LedgerEntryNo_','DocumentNo_')
             sih = sih.select('No_','PaymentTermsCode')
             cpg = cpg.select('Code','ReceivablesAccount')
@@ -108,8 +120,7 @@ for dbe in config["DbEntities"]:
             df = Company.filter(col('DBName')==DBName).filter(col('NewCompanyName') == EntityName)
             df = df.select("StartDate","EndDate")
             Calendar_StartDate = df.select(df.StartDate).collect()[0]["StartDate"]
-            
-            Calendar_StartDate = datetime.datetime.strptime(Calendar_StartDate,"%Y-%m-%d").date()
+            Calendar_StartDate = datetime.datetime.strptime(Calendar_StartDate,'%m/%d/%Y').date()
             
             if datetime.date.today().month>int(MnSt)-1:
                     UIStartYr=datetime.date.today().year-int(yr)+1
@@ -118,10 +129,10 @@ for dbe in config["DbEntities"]:
             UIStartDate=datetime.date(UIStartYr,int(MnSt),1)
             UIStartDate=max(Calendar_StartDate,UIStartDate)
             
-            cdate = datetime.datetime.now().strftime('%Y-%m-%d')
+            cdate = datetime.datetime.now().strftime("%m/%d/%Y")
             Calendar_EndDate_conf=df.select(df.EndDate).collect()[0]["EndDate"]
-            Calendar_EndDate_conf = datetime.datetime.strptime(Calendar_EndDate_conf,"%Y-%m-%d").date()
-            Calendar_EndDate_file=datetime.datetime.strptime(cdate,"%Y-%m-%d").date()
+            Calendar_EndDate_conf = datetime.datetime.strptime(Calendar_EndDate_conf,'%m/%d/%Y').date()
+            Calendar_EndDate_file=datetime.datetime.strptime(cdate,"%m/%d/%Y").date()
             Calendar_EndDate=min(Calendar_EndDate_conf,Calendar_EndDate_file)
             days = (Calendar_EndDate-UIStartDate).days   
             def last_day_of_month(date):
@@ -154,41 +165,41 @@ for dbe in config["DbEntities"]:
                        .select('TempCLE_No','CLE_Document_No','Link_date')
             sqldf = Kockpit.RENAME(sqldf,{'Link_date':'DCLE_MonthEnd'})
             
-            CLE_DCLE_Joined = df2.select('DimSetID','CLE_No','DCLE_Posting_Date','Due_Date','DocumentType','ExternalDocumentNo','CurrencyCode','PaymentTermsCode','Remaining_Amount','Original_Amount',"YearMonth")
+            CLE_DCLE_Joined = df2.select('DimSetID','CLE_No','DCLE_Posting_Date','Due_Date','DocumentType','ExternalDocumentNo','CurrencyCode','PaymentTermsCode','Remaining_Amount','Original_Amount')
             ARsnapshots = sqldf.join(CLE_DCLE_Joined,sqldf.TempCLE_No == CLE_DCLE_Joined.CLE_No,'left')
-            ARsnapshots=ARsnapshots.select('DimSetID','TempCLE_No','DCLE_Posting_Date','Due_Date','DocumentType','ExternalDocumentNo','CurrencyCode','PaymentTermsCode','Remaining_Amount','Original_Amount','CLE_Document_No','DCLE_MonthEnd',"YearMonth")
-            
-            
+            ARsnapshots=ARsnapshots.select('DimSetID','TempCLE_No','DCLE_Posting_Date','Due_Date','DocumentType','ExternalDocumentNo','CurrencyCode','PaymentTermsCode','Remaining_Amount','Original_Amount','CLE_Document_No','DCLE_MonthEnd')
             ARsnapshots=ARsnapshots.filter(ARsnapshots['DCLE_Posting_Date']<= ARsnapshots['DCLE_MonthEnd'])                  
             ARsnapshots = ARsnapshots.groupBy('DimSetID','TempCLE_No','CLE_Document_No','DCLE_MonthEnd','Due_Date','DocumentType','ExternalDocumentNo','PaymentTermsCode','CurrencyCode').agg({'Remaining_Amount':'sum','Original_Amount':'sum'})
             ARsnapshots = Kockpit.RENAME(ARsnapshots,{'sum(Remaining_Amount)':'Remaining_Amount','sum(Original_Amount)':'Original_Amount'})
             ARsnapshots.cache()
             print(ARsnapshots.count())
             
-            CLE_DCLE_Joined = df2.select('CLE_No','Link_Customer','CLE_Posting_Date','Link_SalesPerson','AdvanceCollection','YearMonth').distinct()
+            CLE_DCLE_Joined = df2.select('CLE_No','Link_Customer','CLE_Posting_Date','Link_SalesPerson','AdvanceCollection').distinct()
             ARsnapshots = ARsnapshots.join(CLE_DCLE_Joined,ARsnapshots['TempCLE_No']==CLE_DCLE_Joined['CLE_No'],'left')
+           
+                    
             ARsnapshots = ARsnapshots.withColumn("NOD_AR_Due_Date",datediff(ARsnapshots['DCLE_MonthEnd'],ARsnapshots['Due_Date']))\
                                 .withColumn("NOD_AR_Posting_Date",datediff(ARsnapshots['DCLE_MonthEnd'],ARsnapshots['CLE_Posting_Date']))\
                                 .withColumn("TransactionType",lit('CLE_Entry'))\
                                 .withColumn("AR_AP_Type",when(ARsnapshots['Remaining_Amount']<0, lit('Adv/UnAdj')).otherwise(lit('AR')))
             ARsnapshots = Kockpit.RENAME(ARsnapshots,{'CLE_Document_No':'Document_No','DCLE_MonthEnd':'Link_Date'})
-            ARsnapshots.cache()
-            print(ARsnapshots.count())
             Maxoflt = ARBucket.filter(ARBucket['BucketName']=='<')
             MaxLimit = int(Maxoflt.select('UpperLimit').first()[0])
-        
             Minofgt = ARBucket.filter(ARBucket['BucketName']=='>')
             MinLimit = int(Minofgt.select('LowerLimit').first()[0])
+  
             ARsnapshots = ARsnapshots.join(ARBucket,ARsnapshots.NOD_AR_Posting_Date == ARBucket.Nod,'left').drop('ID','UpperLimit','LowerLimit')
-            ARsnapshots=ARsnapshots.withColumn('BucketName',when(ARsnapshots['NOD_AR_Posting_Date']>=MinLimit, lit("61+")))
-            ARsnapshots=ARsnapshots.withColumn('BucketName',when(ARsnapshots['NOD_AR_Posting_Date']<=MaxLimit, lit("61-")))
+            ARsnapshots=ARsnapshots.withColumn('BucketName',when(ARsnapshots.NOD_AR_Posting_Date>=MinLimit,lit(str(MinLimit)+'+')).otherwise(ARsnapshots.BucketName))\
+                        .withColumn('Nod',when(ARsnapshots.NOD_AR_Posting_Date>=MinLimit,ARsnapshots.NOD_AR_Posting_Date).otherwise(ARsnapshots.Nod))
+            ARsnapshots=ARsnapshots.withColumn('BucketName',when(ARsnapshots.NOD_AR_Posting_Date<=(MaxLimit),lit("Not Due")).otherwise(ARsnapshots.BucketName))\
+                        .withColumn('Nod',when(ARsnapshots.NOD_AR_Posting_Date<=(MaxLimit), ARsnapshots.NOD_AR_Posting_Date).otherwise(ARsnapshots.Nod))
             ARsnapshots = Kockpit.RENAME(ARsnapshots,{'Link_Customer':'LinkCustomer','Link_SalesPerson':'LinkSalesPerson'})
             ARsnapshots = ARsnapshots.withColumn("AdvanceFlag",when(ARsnapshots["AdvanceCollection"]==1,lit('Advance')).otherwise(lit('NA')))\
                                     .withColumnRenamed('DimSetID','DimensionSetID')
-            DSE =DSE.drop("DBName","EntityName")
-            finalDF = ARsnapshots.join(DSE,"DimensionSetID",'left')
-            finalDF = RenameDuplicateColumns(finalDF)
-            finalDF.coalesce(1).write.mode("overwrite").partitionBy("YearMonth").parquet("../../ParquetData/Sales/Receivables_Snapshot")
+            ARsnapshots = ARsnapshots.join(DSE,"DimensionSetID",'left')
+            finalDF = RenameDuplicateColumns(ARsnapshots)
+            finalDF.coalesce(1).write.format("parquet").mode("overwrite").option("overwriteSchema", "true").save(STAGE2_PATH+"/"+"Sales/Receivables_Snapshot")
+          
             logger.endExecution()
             try:
                 IDEorBatch = sys.argv[1]
@@ -198,6 +209,7 @@ for dbe in config["DbEntities"]:
             log_df = spark.createDataFrame(log_dict, logger.getSchema())
             log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)
         
+             
         except Exception as ex:
             exc_type,exc_value,exc_traceback=sys.exc_info()
             print("Error:",ex)
@@ -210,7 +222,7 @@ for dbe in config["DbEntities"]:
                 IDEorBatch = sys.argv[1]
             except Exception as e :
                 IDEorBatch = "IDLE"
-            os.system("spark-submit "+Kockpit_Path+"\Email.py 1 Receivables_Snapshot '"+CompanyName+"' "+DBEntity+" "+str(exc_traceback.tb_lineno)+" ")
+            os.system("spark-submit "+Kockpit_Path+"/Email.py 1 Receivables_Snapshot '"+CompanyName+"' "+DBEntity+" "+str(exc_traceback.tb_lineno)+" ")
             log_dict = logger.getErrorLoggedRecord('Sales.Receivables_Snapshot', DBName, EntityName, str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
             log_df = spark.createDataFrame(log_dict, logger.getSchema())
             log_df.write.jdbc(url=PostgresDbInfo.PostgresUrl, table="logs.logs", mode='append', properties=PostgresDbInfo.props)

@@ -1,29 +1,41 @@
-
 from pyspark.sql import SparkSession,SQLContext
 from pyspark import SparkConf, SparkContext
-from pyspark.sql.functions import lit, year,when,to_date,col
+from pyspark.sql.functions import  when,to_date
 from pyspark.sql.types import *
-import re,os,sys,datetime,time,sys,traceback
 from os.path import dirname, join, abspath
+import os,sys
 import datetime as dt 
-from builtins import str
-from datetime import date
-begintime =dt.datetime.now()
+from builtins import str 
+st = dt.datetime.now()
 Kockpit_Path =abspath(join(join(dirname(__file__),'..','..','..','..','..')))
-sys.path.insert(0,'../../../..')
+DB1_path =abspath(join(join(dirname(__file__),'..','..','..','..')))
+sys.path.insert(0,'../../')
+sys.path.insert(0, DB1_path)
 from Configuration.AppConfig import * 
 from Configuration.Constant import *
 from Configuration.udf import *
 from Configuration import udf as Kockpit
-st = dt.datetime.now()
 Filepath = os.path.dirname(os.path.abspath(__file__))
 FilePathSplit = Filepath.split('\\')
 DBName = FilePathSplit[-5]
 EntityName = FilePathSplit[-4]
 DBEntity = DBName+EntityName
+STAGE1_Configurator_Path=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage1/ConfiguratorData/"
+STAGE1_PATH=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage1/ParquetData"
+STAGE2_PATH=Kockpit_Path+"/" +DBName+"/" +EntityName+"/" +"Stage2/ParquetData"
 conf = SparkConf().setMaster("local[*]").setAppName("SalesTarget").\
+                    set("spark.sql.shuffle.partitions",16).\
                     set("spark.serializer", "org.apache.spark.serializer.KryoSerializer").\
                     set("spark.local.dir", "/tmp/spark-temp").\
+                    set("spark.driver.memory","30g").\
+                    set("spark.executor.memory","30g").\
+                    set("spark.driver.cores",'*').\
+                    set("spark.driver.maxResultSize","0").\
+                    set("spark.sql.debug.maxToStringFields", "1000").\
+                    set("spark.executor.instances", "20").\
+                    set('spark.scheduler.mode', 'FAIR').\
+                    set("spark.sql.broadcastTimeout", "36000").\
+                    set("spark.network.timeout", 10000000).\
                     set("spark.sql.legacy.parquet.datetimeRebaseModeInWrite", "LEGACY").\
                     set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "LEGACY").\
                     set("spark.sql.legacy.parquet.datetimeRebaseModeInRead", "CORRECTED").\
@@ -38,20 +50,16 @@ for dbe in config["DbEntities"]:
         CompanyName=dbe['Name']
         CompanyName=CompanyName.replace(" ","")
         try:
-            logger = Logger()
-            GLB = spark.read.parquet("../../../Stage1/ParquetData/G_LBudgetEntry").drop("DBName","EntityName")
-            GLB=GLB.select("EntryNo_","BudgetDimension1Code",'BudgetDimension2Code',"BudgetDimension3Code","DimensionSetID","BudgetName","Description","G_LAccountNo_","Date","Amount")
             
-            GLMap = spark.read.parquet("../../../Stage1/ConfiguratorData\\tblGLAccountMapping")
-         
+            logger = Logger()
+            GLB = spark.read.format("parquet").load(STAGE1_PATH+"/G_L Budget Entry")
+            GLMap = spark.read.format("parquet").load(STAGE1_Configurator_Path+"/tblGLAccountMapping")
+            DSE =spark.read.format("parquet").load(STAGE1_PATH+"/Dimension Set Entry")
             GLB=GLB.withColumn("LinkDate",to_date(GLB.Date))\
                     .withColumn("Amount",GLB.Amount*-1).drop('Date')
-            
             GLB=RENAME(GLB,{"G_LAccountNo_":"GLAccount","BudgetDimension1Code":"RSM_TMC"
                                        ,"BudgetDimension2Code":"Link_TARGETPROD","DimensionSetID":"DimSetID"})
             GLB=GLB.withColumn('LinkSalesPerson',when(GLB['RSM_TMC']=='4485', GLB['RSM_TMC']).otherwise(GLB['BudgetDimension3Code']))
-            DSE = spark.read.parquet("../../../Stage1/ParquetData/DimensionSetEntry")
-        
             SUBBU=DSE.filter(DSE['DimensionCode']=='SUBBU')
             GLB = GLB.join(SUBBU, GLB['DimSetId']==SUBBU['DimensionSetId'], 'left')
             GLB = GLB.withColumnRenamed("DimensionValueCode","LINK_SUBBU")
@@ -60,13 +68,11 @@ for dbe in config["DbEntities"]:
             GLB = GLB.join(SBU, GLB['DimSetId']==SBU['DimensionSetId'], 'left')
             GLB = GLB.withColumnRenamed("DimensionValueCode","LINK_SBU")
             GLB = GLB.select("LinkDate","Amount","GLAccount","RSM_TMC","DimSetID","Link_TARGETPROD","LINK_SUBBU","LINK_SBU","BudgetName","LinkSalesPerson")
-            
             GLMap = GLMap.withColumnRenamed('GLRangeCategory','GLCategory')\
                                 .withColumnRenamed('FromGLCode','FromGL')\
                                 .withColumnRenamed('ToGLCode','ToGL')
             GLRange = GLMap.filter(GLMap["GLCategory"] == 'REVENUE').filter(GLMap["DBName"] == DBName)\
                                     .filter(GLMap["EntityName"] == EntityName).select("GLCategory","FromGL","ToGL")
-                                    
             NoOfRows=GLRange.count()
             for i in range(0,NoOfRows):
                         if i==0:
@@ -78,9 +84,8 @@ for dbe in config["DbEntities"]:
                                                & (GLB.GLAccount<=GLRange.select('ToGL').collect()[i]['ToGL']))              
             GLB=GLB.filter(GLB['BudgetName'].like('SALESTGT%'))\
                      .filter(Range)
-            GLB.coalesce(1).write.mode("overwrite").parquet("../../../Stage2/ParquetData/Sales/SalesTarget")
+            GLB.coalesce(1).write.format("parquet").mode("overwrite").option("overwriteSchema", "true").save(STAGE2_PATH+"/"+"Sales/SalesTarget")
             logger.endExecution()
-            
             try:
                 IDEorBatch = sys.argv[1]
             except Exception as e :
@@ -101,7 +106,7 @@ for dbe in config["DbEntities"]:
                 IDEorBatch = sys.argv[1]
             except Exception as e :
                 IDEorBatch = "IDLE"
-            os.system("spark-submit "+Kockpit_Path+"\Email.py 1 SalesTarget '"+CompanyName+"' "+DBEntity+" "+str(exc_traceback.tb_lineno)+" ")
+            os.system("spark-submit "+Kockpit_Path+"/Kockpit/Email.py 1 SalesTarget '"+CompanyName+"' "+DBEntity+" "+str(exc_traceback.tb_lineno)+"")
             
             log_dict = logger.getErrorLoggedRecord('Sales.SalesTarget', DBName, EntityName, str(ex), str(exc_traceback.tb_lineno), IDEorBatch)
             log_df = spark.createDataFrame(log_dict, logger.getSchema())
